@@ -2,15 +2,17 @@ import math
 from itertools import product
 
 from click import confirm
-from app import app, Login
-from flask import render_template, request, redirect, session,jsonify
+from app import app, Login,db
+from flask import render_template, request, redirect, session,jsonify,flash
 import dao
 from flask_login import login_user, logout_user, current_user, login_required
 import utils
-from app.dao import load_book, save_bill, get_bill, load_bill, get_bookname, change_bill, count_book
+from app.dao import load_book, save_bill, get_bill, load_bill, get_bookname, change_bill, count_book, save_bill_by_em
 from app.utils import stats_cart
 from decorators import annonymous_user,annonymous_employee
-from app.models import UserRole
+from app.models import UserRole,Author,Book,PublishingHouse
+import cloudinary
+import cloudinary.uploader
 import admin
 
 
@@ -25,6 +27,87 @@ def index():
     total = count_book()
 
     return render_template('index.html',books=book,pages=math.ceil(total/page_size))
+
+@app.route('/add-books-batch', methods=['POST','GET'])
+def add_books_batch():
+    if request.method == 'POST':
+        errors = []
+        books_to_add = []  # Danh sách chứa các sách cần thêm vào CSDL
+        index = 0
+        while True:
+            # Lấy thông tin sách từ form
+            name = request.form.get(f'books[{index}][name]')
+            price = request.form.get(f'books[{index}][price]')
+            author_name = request.form.get(f'books[{index}][author]')
+            publisher_name = request.form.get(f'books[{index}][publisher]')
+            quantity = request.form.get(f'books[{index}][quantity]')
+            avatar=request.files.get('avatar')
+
+            print(avatar)
+            res=cloudinary.uploader.upload(avatar)
+
+            # Nếu không có tên sách, dừng vòng lặp (không còn sản phẩm)
+            if not name:
+                break
+
+            # Chuyển đổi giá trị price và quantity, kiểm tra hợp lệ
+            try:
+                price = float(price or 0)  # Nếu giá trị không hợp lệ, đặt mặc định là 0
+                quantity = int(quantity or 0)  # Nếu số lượng không hợp lệ, đặt mặc định là 0
+            except ValueError:
+                errors.append(f"Lỗi định dạng giá trị tại dòng {index + 1}")
+                index += 1
+                continue  # Bỏ qua sản phẩm này nếu giá trị không hợp lệ
+
+            # Kiểm tra tính hợp lệ của dữ liệu
+            if not name or not author_name or quantity <= 0 or price < 0:
+                errors.append(f'Thông tin không hợp lệ tại dòng {index + 1}')
+                index += 1
+                continue  # Bỏ qua sản phẩm không hợp lệ
+
+            # Truy vấn hoặc tạo mới Author và Publisher từ cơ sở dữ liệu
+            author = Author.query.filter_by(name=author_name).first()
+            if not author:
+                author = Author(name=author_name)  # Tạo mới nếu không tìm thấy
+                db.session.add(author)
+
+            publisher = PublishingHouse.query.filter_by(name=publisher_name).first()
+            if not publisher:
+                publisher = PublishingHouse(name=publisher_name)  # Tạo mới nếu không tìm thấy
+                db.session.add(publisher)
+
+            # Kiểm tra xem sách đã tồn tại hay chưa (dựa vào tên, tác giả và nhà xuất bản)
+            existing_book = Book.query.filter_by(name=name, author_id=author.id, publishinghouse_id=publisher.id).first()
+
+            if existing_book:
+                # Nếu sách đã tồn tại, cộng số lượng mới vào số lượng cũ
+                # existing_book.quantity += quantity
+                pass
+            else:
+                # Nếu sách chưa tồn tại, thêm vào danh sách thêm mới
+                books_to_add.append(Book(
+                    name=name,
+                    price=price,
+                    author_id=author.id,
+                    publishinghouse_id=publisher.id,
+                ))
+
+            index += 1
+
+        # Thêm sách mới vào cơ sở dữ liệu (nếu có)
+        if books_to_add:
+            db.session.add_all(books_to_add)
+
+        # Commit chỉ một lần sau khi tất cả thay đổi được xử lý
+        db.session.commit()
+
+        # Thông báo kết quả
+        if not errors:
+            flash(f'Đã thêm và cập nhật sách thành công!', 'success')
+        else:
+            flash('Có lỗi khi thêm sản phẩm: ' + ', '.join(errors), 'error')
+
+    return render_template('add-books-batch.html')
 
 @app.route("/login", methods=['get','post'])
 @annonymous_user
@@ -130,16 +213,22 @@ def delete_cart(book_id):
 @app.route('/api/pay')
 def pay():
     cart=session.get('cart')
+    bill=session.get(('bill'))
     # import pdb
     # pdb.set_trace()
     try:
-        save_bill(cart)
+        if current_user.user_role==UserRole.CUSTOMER:
+            save_bill(cart)
+        else:
+            save_bill_by_em(bill)
     except Exception as ex:
         print(str(ex))
         return jsonify({'status':500})
     else:
-        del session['cart']
-
+        if current_user.user_role==UserRole.CUSTOMER:
+            del session['cart']
+        else:
+            del session['bill']
     return jsonify({'status':200})
 
 @app.route('/api/order')
